@@ -6,13 +6,13 @@ from pathlib import Path
 import bpy
 import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
-ZIP = Path(sys.argv[sys.argv.index('--') + 1]) if '--' in sys.argv else ROOT/'dist/live2d_offline_converter-0.2.0.zip'
+ZIP = Path(sys.argv[sys.argv.index('--') + 1]) if '--' in sys.argv else ROOT/'dist/live2d_offline_converter-0.3.0.zip'
 bpy.ops.preferences.addon_install(filepath=str(ZIP), overwrite=True)
 bpy.ops.preferences.addon_enable(module='live2d_blender')
 import live2d_blender
 from live2d_blender import blender_bridge as bridge
 from live2d_blender.fixture import SyntheticBackend
-assert live2d_blender.bl_info['version'] == (0, 2, 0)
+assert live2d_blender.bl_info['version'] == (0, 3, 0)
 assert 'addons' in str(Path(live2d_blender.__file__))
 bpy.ops.object.select_all(action='SELECT'); bpy.ops.object.delete(use_global=False)
 checks = []
@@ -73,7 +73,7 @@ for mode in ('GLOBAL', 'DRAWABLE', 'MANUAL'):
     assert bpy.ops.live2d.convert_independent() == {'FINISHED'}
     rig = bpy.context.object
     report = json.loads(rig['conversion_report'])
-    check(report['version'] == '0.2.0' and report['fitting']['grouping'] == mode, mode + ' registered UI conversion')
+    check(report['version'] == '0.3.0' and report['fitting']['grouping'] == mode, mode + ' registered UI conversion')
     check(report['fitting']['bind_selection']['summary']['changed_rest_pieces'] == 1, mode + ' training-only collapsed bind repair')
     check(report['fitting']['static_vertices'] >= 33, mode + ' independent static vertices')
     check(len(report['bone_key_times']) == 73, mode + ' 9x matrix-key refinement')

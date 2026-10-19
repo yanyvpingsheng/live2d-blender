@@ -20,6 +20,7 @@ addon/live2d_blender/demo_assets/peach.png
 addon/live2d_blender/fit_pipeline.py
 addon/live2d_blender/fixture.py
 addon/live2d_blender/independent_convert.py
+addon/live2d_blender/mask_bake.py
 addon/live2d_blender/motion.py
 addon/live2d_blender/native_effects.py
 addon/live2d_blender/physics.py
@@ -32,6 +33,7 @@ addon/live2d_blender/skinning_blender.py
 addon/live2d_blender/timeline.py
 demo/README.md
 docs/GROUPING_zh.md
+docs/MASKS_BLENDS_zh.md
 docs/TESTING.md
 docs/VALIDATION.md
 fixtures/demo.motion3.json
@@ -57,8 +59,11 @@ tests/blender_v02_install_convert.py
 tests/blender_v02_reopen.py
 tests/blender_v02_review_child_transform.py
 tests/blender_v02_review_root_transform.py
+tests/blender_v03_appearance.py
+tests/blender_v03_materials.py
 tests/test_core_python.py
 tests/test_cpu_renderer.py
+tests/test_mask_bake.py
 tests/test_native_effects.py
 tests/test_native_snapshot_cache.py
 tests/test_physics_bridge.py

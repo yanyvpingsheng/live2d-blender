@@ -38,3 +38,7 @@ demo/*.png
 demo/*.json
 docs/*_results.json
 .DS_Store
+
+# Original regenerated v0.3 appearance fixtures and alpha sequences.
+demo/v03_appearance/
+live2d_masks/

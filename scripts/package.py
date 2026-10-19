@@ -9,7 +9,7 @@ import json
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = '0.2.0'
+VERSION = '0.3.0'
 names = (ROOT / 'PUBLIC_FILES.txt').read_text(encoding='utf-8').splitlines()
 addon_names = [name for name in names if name.startswith('addon/live2d_blender/')]
 assert 'addon/live2d_blender/__init__.py' in addon_names

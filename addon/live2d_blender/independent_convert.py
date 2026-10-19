@@ -1,12 +1,15 @@
 """Explicit, offline conversion to ordinary Blender bones and native effects.
 
 Core/Framework are only used while sampling. The output receives no runtime
-handlers, drivers, shape keys or mesh caches. Affine skinning is approximate.
+handlers, drivers, shape keys or geometry caches. Alpha-only mask image sequences
+are optional conversion outputs. Affine skinning is approximate.
 """
 from dataclasses import replace
 import json
 import math
+import shutil
 from types import SimpleNamespace
+from pathlib import Path
 import numpy as np
 import bpy
 from mathutils import Matrix
@@ -73,7 +76,9 @@ def _bake_root_world(container, captured):
 def convert_timeline(context, root, start, end, step=1, bone_count=8, iterations=20,
                      native_effects=True, allow_lossy=False, *, grouping='GLOBAL',
                      manual_mapping=None, repair_bind=True, separate_static=True,
-                     static_tolerance=1e-6, subdivisions=9):
+                     static_tolerance=1e-6, subdivisions=9, appearance_mode='STRICT',
+                     allow_opaque_multiply=False, mask_resolution=512,
+                     mask_directory='//live2d_masks'):
     """Sample a direct Blender timeline and generate independent skeletal data.
 
     Healthy first-sample meshes remain at rest; optional training-only repair
@@ -81,6 +86,13 @@ def convert_timeline(context, root, start, end, step=1, bone_count=8, iterations
     affine influence exports two actual bones. Layer depth is frozen in mesh
     rest coordinates and optionally animated by native effect object tracks.
     """
+    if appearance_mode not in ('STRICT', 'NATIVE_APPROXIMATE'):
+        raise Live2DError('Unknown appearance mode')
+    native_appearance = appearance_mode == 'NATIVE_APPROXIMATE'
+    if native_appearance and not native_effects:
+        raise Live2DError('Native mask/blend conversion requires native effects')
+    if native_appearance and context.scene.render.engine != 'CYCLES':
+        raise Live2DError('Select Cycles before using native mask/blend approximation')
     runtime = bridge.runtime_for_root(root)
     if runtime is None:
         raise Live2DError('Reconnect the conversion source first')
@@ -112,9 +124,11 @@ def convert_timeline(context, root, start, end, step=1, bone_count=8, iterations
     original_subframe = context.scene.frame_subframe
     previous_busy = bridge._BUSY
     existing = {kind: set(getattr(bpy.data, kind)) for kind in
-                ('objects', 'meshes', 'armatures', 'materials', 'actions', 'collections', 'node_groups')}
+                ('objects', 'meshes', 'armatures', 'materials', 'actions', 'collections', 'node_groups', 'images')}
     result = None
     succeeded = False
+    mask_bake = None
+    source_visibility = [(obj, obj.hide_get(), obj.hide_render) for obj in runtime.objects]
     bridge._BUSY = True
     try:
         class TimelineBackend:
@@ -130,8 +144,16 @@ def convert_timeline(context, root, start, end, step=1, bone_count=8, iterations
                                  fps=context.scene.render.fps / context.scene.render.fps_base,
                                  depth_step=root.live2d.depth_step)
         unsupported = [p for p in sample.pieces if p['masks'] or p['blend_mode'] != 0]
-        if unsupported and not allow_lossy:
-            raise Live2DError(f'{len(unsupported)} pieces use clipping or destination-dependent blends; enable explicit lossy appearance conversion to proceed')
+        if native_appearance:
+            if any(p['blend_mode'] not in (0, 1, 2) for p in sample.pieces):
+                raise Live2DError('Native appearance supports only legacy normal/add/multiply, not newer blend/offscreen modes')
+            if any(p['blend_mode'] == 2 for p in sample.pieces):
+                if not allow_opaque_multiply or context.scene.render.film_transparent:
+                    raise Live2DError('Multiply requires explicit opaque-backdrop acceptance and Film Transparent disabled; transparent RGBA exports are not supported')
+            if any(p['masks'] for p in sample.pieces) and not bpy.data.filepath:
+                raise Live2DError('Save the .blend before baking portable alpha mask sequences')
+        elif unsupported and not allow_lossy:
+            raise Live2DError(f'{len(unsupported)} pieces use clipping or destination-dependent blends; choose native mask/blend approximation, or explicitly accept missing appearance')
         training_fit, fit, export_frames, fit_report = fit_animation(
             sample, frames, bone_budget=bone_count, iterations=iterations,
             grouping=grouping, manual_mapping=manual_mapping, repair_bind=repair_bind,
@@ -155,7 +177,9 @@ def convert_timeline(context, root, start, end, step=1, bone_count=8, iterations
             effects_report = bake_native_effects(result['objects_by_id'], frames, sample.channels, sample.pieces,
                                                   images=images, depth_step=root.live2d.depth_step,
                                                   bone_depth_animated=result['bone_depth_animated'],
-                                                  allow_unsupported=allow_lossy)
+                                                  allow_unsupported=allow_lossy and not native_appearance,
+                                                  native_blending=native_appearance, masks_baked=native_appearance,
+                                                  allow_opaque_multiply=allow_opaque_multiply)
         else:
             # Frozen appearance uses the first sample, not the last pose visited
             # during offline capture. Animation remains geometric only.
@@ -176,16 +200,51 @@ def convert_timeline(context, root, start, end, step=1, bone_count=8, iterations
         for obj in [result['armature']] + result['meshes']:
             obj.parent = container
             obj.matrix_parent_inverse.identity()
+        if native_appearance:
+            # Copy and pack only the output's original color textures. Sequence
+            # masks remain external and portable beside the saved blend.
+            packed = {}
+            for obj in result['meshes']:
+                for mat in obj.data.materials:
+                    node = mat.node_tree.nodes.get('NE Texture')
+                    if node is None:
+                        continue
+                    source = node.image
+                    if source not in packed:
+                        copy = source.copy(); copy.name = source.name + ' Independent packed'
+                        if source.source == 'GENERATED':
+                            pixels = np.empty(len(source.pixels), np.float32)
+                            source.pixels.foreach_get(pixels); copy.pixels.foreach_set(pixels)
+                        copy.pack(); packed[source] = copy
+                    node.image = packed[source]
+            effects_report['packed_color_textures'] = len(packed)
+            if any(p['masks'] for p in sample.pieces):
+                from .mask_bake import bake_mask_sequences, attach_mask
+                mask_bake = bake_mask_sequences(context, result['objects_by_id'], sample.pieces,
+                                                images, int(start), int(end), container,
+                                                mask_directory, resolution=mask_resolution)
+                for ident, (image, bounds, inverted) in mask_bake['bindings'].items():
+                    obj = result['objects_by_id'][ident]
+                    for mat in obj.data.materials:
+                        attach_mask(mat, image, bounds, inverted, container, int(start), int(end))
+            effects_report['transparent_ray_limit'] = context.scene.cycles.transparent_max_bounces
+            effects_report['warnings'].append('Increase Cycles transparent bounces until the render converges; dense stacks may darken at the default ray limit.')
+        mask_report = None if mask_bake is None else {key: value for key, value in mask_bake.items()
+                                                     if key not in ('bindings', 'images', 'directory', 'created_roots')}
+        if mask_report is not None:
+            mask_report['directory'] = bpy.path.relpath(mask_bake['directory'])
         report = {'method': 'Sparse affine weighted bones; approximate sampled timeline',
                   'logical_bones': int(fit.weights.shape[1]), 'actual_bones': len(result['armature'].data.bones),
                   'max_influences': int((fit.weights > 1e-10).sum(axis=1).max()),
-                  'version': '0.2.0', 'frames': frames, 'bone_key_times': export_frames.tolist(),
+                  'version': '0.3.0', 'frames': frames, 'bone_key_times': export_frames.tolist(),
                   'training_metrics': training_fit.metrics, 'fitting': fit_report,
                   'non_geometric_changes': sample.non_geometric_changes, 'sampling_warnings': sample.warnings,
-                  'native_effects': effects_report, 'root_transform': root_transform_report,
+                  'native_effects': effects_report, 'alpha_masks': mask_report,
+                  'appearance_mode': appearance_mode, 'root_transform': root_transform_report,
                   'requires_live2d_runtime': False,
                   'holdout_tested': False,
-                  'appearance_loss': 'Clipping masks and destination-dependent blending are not preserved' if unsupported else ''}
+                  'appearance_loss': ('Finite-resolution integer-frame masks; scene-linear Cycles blending without per-Drawable clamp. Multiply needs an opaque backdrop; not general SDK pixel parity.' if native_appearance else
+                                      'Clipping masks and destination-dependent blending are not preserved' if unsupported else '')}
         result['armature']['conversion_report'] = json.dumps(report, ensure_ascii=False)
         result['report'] = report
         for obj in runtime.objects:
@@ -201,10 +260,19 @@ def convert_timeline(context, root, start, end, step=1, bone_count=8, iterations
     except Exception:
         if context.object and context.object.mode != 'OBJECT':
             bpy.ops.object.mode_set(mode='OBJECT')
-        for kind in ('objects', 'collections', 'meshes', 'armatures', 'materials', 'actions', 'node_groups'):
+        for obj, hidden, render_hidden in source_visibility:
+            obj.hide_set(hidden); obj.hide_render = render_hidden
+        for kind in ('objects', 'collections', 'meshes', 'armatures', 'materials', 'actions', 'node_groups', 'images'):
             data = getattr(bpy.data, kind)
             for item in set(data) - existing[kind]:
                 data.remove(item, do_unlink=True)
+        if mask_bake is not None:
+            shutil.rmtree(mask_bake['directory'])
+            for folder in reversed(mask_bake.get('created_roots', [])):
+                try:
+                    Path(folder).rmdir()  # Only our own, still-empty ancestors.
+                except OSError:
+                    pass
         raise
     finally:
         try:

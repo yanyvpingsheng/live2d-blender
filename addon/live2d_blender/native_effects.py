@@ -1,7 +1,7 @@
 """Bake sampled non-geometric channels into ordinary Blender data.
 
 Conversion-time helper only. Saved materials, node groups and F-curves play in
-Blender without this module, Core, drivers, frame/depsgraph handlers, or caches.
+Blender without this module, Core, drivers, frame/depsgraph handlers, or geometry caches.
 Pass exported per-Drawable meshes, NEVER live source objects. XY location curves,
 mesh vertices, vertex weights and armature actions are not modified.
 
@@ -9,8 +9,9 @@ Color math matches legacy per-Drawable multiply/screen operations in encoded
 sRGB: Blender's scene-linear texture color is encoded, tinted, then decoded to
 scene-linear emission with exact piecewise transfer functions. Texture alpha,
 Drawable opacity and visibility remain separate. This is not a complete match
-for encoded-space multi-layer SDK compositing, complex masks, or add/multiply
-DRAWABLE blend modes. Those are explicit unsupported channels, not tint colors.
+for encoded-space multi-layer SDK compositing. Optional legacy add/multiply use
+scene-linear Cycles shader arithmetic; multiply requires an opaque backdrop.
+Alpha-only masks are attached by the separate conversion-time mask baker.
 """
 import math
 import numpy as np
@@ -129,8 +130,15 @@ def _transfer_group(kind):
     return group
 
 
-def make_native_material(image, name='Native Effects', *, double_sided=True, color_math='srgb'):
-    """New standalone normal-alpha emission material; never edits input image.
+def make_native_material(image, name='Native Effects', *, double_sided=True, color_math='srgb',
+                         blend_mode=0, allow_opaque_multiply=False):
+    """New standalone emission/transmission material; never edits input image.
+
+    blend_mode 0 is normal alpha, 1 adds radiance without attenuating the
+    destination, and 2 tints transmission. Mode 2 requires explicit acceptance
+    of opaque-backdrop-only correctness; it changes fractional backdrop alpha.
+    Add/multiply arithmetic is scene-linear, with no per-Drawable UNORM clamp.
+    The named NE Masked Alpha node accepts baked coverage on input 1.
 
     The texture Color socket must supply scene-linear straight RGB. Use properly
     tagged sRGB FILE images, or generated float images explicitly decoded to
@@ -142,6 +150,10 @@ def make_native_material(image, name='Native Effects', *, double_sided=True, col
     import bpy
     if color_math not in ('srgb', 'linear'):
         raise Live2DError('color_math must be srgb or linear')
+    if blend_mode not in (0, 1, 2):
+        raise Live2DError('Only legacy normal/add/multiply blend modes are supported')
+    if blend_mode == 2 and not allow_opaque_multiply:
+        raise Live2DError('Multiply needs explicit opaque-backdrop acceptance; transparent RGBA export is not supported')
     if image is None:
         raise Live2DError('A texture image is required for each exported Drawable')
     if image.colorspace_settings.is_data:
@@ -153,7 +165,10 @@ def make_native_material(image, name='Native Effects', *, double_sided=True, col
         material.surface_render_method = 'DITHERED'
     elif hasattr(material, 'blend_method'):
         material.blend_method = 'BLEND'
-    material['_native_effects_version'] = 1
+    material['_native_effects_version'] = 2
+    material['_native_blend_mode'] = blend_mode
+    material['_native_multiply_requires_opaque_backdrop'] = blend_mode == 2
+    material['_native_blend_space'] = 'scene-linear'
     material['_native_effects_color_math'] = color_math
     nodes, links = material.node_tree.nodes, material.node_tree.links
     nodes.clear()
@@ -184,13 +199,30 @@ def make_native_material(image, name='Native Effects', *, double_sided=True, col
     transparent = nodes.new('ShaderNodeBsdfTransparent')
     alpha = _math(nodes, links, 'MULTIPLY', texture.outputs['Alpha'], opacity.outputs[0])
     alpha = _math(nodes, links, 'MULTIPLY', alpha, visible.outputs[0])
-    mix = nodes.new('ShaderNodeMixShader')
-    links.new(alpha, mix.inputs[0]); links.new(transparent.outputs[0], mix.inputs[1]); links.new(emission.outputs[0], mix.inputs[2])
-    surface = mix.outputs[0]
+    masked = nodes.new('ShaderNodeMath'); masked.name = 'NE Masked Alpha'
+    masked.operation = 'MULTIPLY'; masked.inputs[1].default_value = 1.0
+    links.new(alpha, masked.inputs[0]); alpha = masked.outputs[0]
+    if blend_mode == 0:
+        mix = nodes.new('ShaderNodeMixShader')
+        links.new(alpha, mix.inputs[0]); links.new(transparent.outputs[0], mix.inputs[1]); links.new(emission.outputs[0], mix.inputs[2])
+        surface = mix.outputs[0]
+    elif blend_mode == 1:
+        # A black additive texel must leave the backdrop unchanged, not cover it.
+        links.new(alpha, emission.inputs['Strength'])
+        add = nodes.new('ShaderNodeAddShader'); add.name = 'NE Legacy Add'
+        links.new(transparent.outputs[0], add.inputs[0]); links.new(emission.outputs[0], add.inputs[1])
+        surface = add.outputs[0]
+    else:
+        factor = nodes.new('ShaderNodeMixRGB'); factor.name = 'NE Opaque Multiply'
+        factor.blend_type = 'MIX'; factor.inputs[1].default_value = (1, 1, 1, 1)
+        links.new(alpha, factor.inputs[0]); links.new(color, factor.inputs[2])
+        links.new(factor.outputs[0], transparent.inputs['Color'])
+        surface = transparent.outputs[0]
     if not double_sided:
         geometry = nodes.new('ShaderNodeNewGeometry'); cull = nodes.new('ShaderNodeMixShader')
+        passthrough = nodes.new('ShaderNodeBsdfTransparent')
         links.new(geometry.outputs['Backfacing'], cull.inputs[0])
-        links.new(surface, cull.inputs[1]); links.new(transparent.outputs[0], cull.inputs[2]); surface = cull.outputs[0]
+        links.new(surface, cull.inputs[1]); links.new(passthrough.outputs[0], cull.inputs[2]); surface = cull.outputs[0]
     links.new(surface, output.inputs['Surface'])
     return material
 
@@ -211,7 +243,8 @@ def _image_for(obj, piece, images):
 
 def bake_native_effects(objects_by_id, frames, channels, pieces, images=None, *,
                         depth_step=0.0001, color_math='srgb', bone_depth_animated=False,
-                        allow_unsupported=False, replace_z_animation=False):
+                        allow_unsupported=False, replace_z_animation=False, native_blending=False,
+                        masks_baked=False, allow_opaque_multiply=False):
     """Bake channels aligned [sample, piece] onto separate exported meshes.
 
     Samples use sampling.SampledAnimation.channels. Rest mesh geometry already
@@ -223,8 +256,11 @@ def bake_native_effects(objects_by_id, frames, channels, pieces, images=None, *,
     Only object.location[2] is keyed; location X/Y, rotations, weights, modifiers
     and armature actions are preserved. Opacity and RGB tint curves are LINEAR;
     visibility and render order are CONSTANT. Static channels get no F-curves.
-    Unknown mask/blend behavior requires allow_unsupported=True and is reported.
-    A normal-alpha approximation is then made for those material appearances.
+    native_blending=True emits legacy blend nodes; multiply additionally requires
+    allow_opaque_multiply=True. masks_baked=True is reserved for a caller that
+    attaches coverage with mask_bake before exposing the result. Remaining
+    unknown behavior requires allow_unsupported=True and is reported as a
+    normal-alpha approximation. Unknown blend IDs are never guessed in native mode.
     """
     frames, channels = validate_channels(pieces, frames, channels)
     if not math.isfinite(depth_step) or depth_step <= 0:
@@ -234,8 +270,12 @@ def bake_native_effects(objects_by_id, frames, channels, pieces, images=None, *,
     ordering_changes = bool(np.any(channels['render_order'] != channels['render_order'][0]))
     if bone_depth_animated and ordering_changes:
         raise Live2DError('Render order is already animated in bone depth; object Z would apply it twice')
-    unsupported = {'masks': [p['id'] for p in pieces if p.get('masks')],
-                   'blend_modes': [p['id'] for p in pieces if p.get('blend_mode', 0) != 0]}
+    if native_blending and any(p.get('blend_mode', 0) not in (0, 1, 2) for p in pieces):
+        raise Live2DError('Native materials support only legacy normal/add/multiply blend modes')
+    if native_blending and not allow_opaque_multiply and any(p.get('blend_mode', 0) == 2 for p in pieces):
+        raise Live2DError('Multiply needs explicit opaque-backdrop acceptance')
+    unsupported = {'masks': [p['id'] for p in pieces if p.get('masks') and not masks_baked],
+                   'blend_modes': [p['id'] for p in pieces if p.get('blend_mode', 0) != 0 and not native_blending]}
     if any(unsupported.values()) and not allow_unsupported:
         raise Live2DError('Complex masks/non-normal Drawable blend modes need a separate native solution; explicitly allow approximation to bake these channels alone')
     active = []
@@ -263,10 +303,17 @@ def bake_native_effects(objects_by_id, frames, channels, pieces, images=None, *,
               'material_actions': 0, 'object_z_actions': 0, 'unsupported': unsupported,
               'color_math': color_math, 'frames': frames.tolist(), 'runtime_dependencies': [],
               'warnings': ['Per-Drawable native tinting and opacity are baked; this does not certify complete multi-layer SDK compositing parity.']}
+    result['native_blending'] = native_blending
+    result['blend_counts'] = {str(mode): sum(p.get('blend_mode', 0) == mode for p in pieces) for mode in (0, 1, 2)}
+    result['multiply_requires_opaque_backdrop'] = bool(native_blending and result['blend_counts']['2'])
+    if native_blending:
+        result['warnings'].append('Cycles-only legacy blend approximation: scene-linear blending, no per-Drawable saturation; multiply requires an opaque backdrop. Transparent exports are not generally SDK-equivalent.')
     if any(unsupported.values()):
         result['warnings'].append('Masks and non-normal Drawable blend modes remain explicit normal-alpha approximations.')
     for index, obj, piece, image, original_z, changes_order in active:
-        mat = make_native_material(image, 'Native ' + piece['id'], double_sided=piece.get('double_sided', True), color_math=color_math)
+        mat = make_native_material(image, 'Native ' + piece['id'], double_sided=piece.get('double_sided', True), color_math=color_math,
+                                   blend_mode=piece.get('blend_mode', 0) if native_blending else 0,
+                                   allow_opaque_multiply=allow_opaque_multiply)
         obj.data.materials.clear(); obj.data.materials.append(mat)
         for polygon in obj.data.polygons:
             polygon.material_index = 0
@@ -325,5 +372,5 @@ def bake_native_effects(objects_by_id, frames, channels, pieces, images=None, *,
         for channel, node_name in mapping.items():
             value = channels[channel][0, index]
             nodes[node_name].outputs[0].default_value = (*value[:3], 1.0) if np.ndim(value) else float(value)
-        obj['_native_effects_version'] = 1
+        obj['_native_effects_version'] = 2
     return result

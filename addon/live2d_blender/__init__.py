@@ -2,12 +2,12 @@
 bl_info = {
     'name': 'Live2D Offline Converter (Research Prototype)',
     'author': 'Live2D Blender Research',
-    'version': (0, 2, 0),
+    'version': (0, 3, 0),
     'blender': (4, 2, 0),
     'location': 'File > Import; 3D View > Sidebar > Live2D',
     'description': 'Offline Live2D sampling to independent bones, weights and native effect Actions',
     'category': 'Import-Export',
-    'warning': 'Approximate skeletal fitting; advanced clipping/blending is incomplete.',
+    'warning': 'Approximate fitting; native masks/blends require Cycles and documented limits.',
 }
 
 try:
@@ -49,7 +49,14 @@ if bpy is not None:
         skin_subdivisions: EnumProperty(name='Matrix key subdivisions', items=tuple((str(n), str(n), 'Generated only from fitted training matrices') for n in (1, 3, 5, 9, 15, 31)), default='9')
         skin_iterations: IntProperty(name='Fit iterations', default=20, min=1, max=100)
         skin_native_effects: BoolProperty(name='Bake native opacity / tint / layer effects', default=True)
-        skin_allow_lossy: BoolProperty(name='Accept missing masks / advanced blends', default=False)
+        skin_appearance: EnumProperty(name='Appearance', items=(
+            ('STRICT', 'Basic / strict', 'Reject masks and non-normal blends unless explicitly dropped below'),
+            ('NATIVE_APPROXIMATE', 'Native masks + blends (Cycles approximation)', 'Bake alpha-only sequences and scene-linear legacy blend nodes; no general SDK pixel parity')), default='STRICT')
+        skin_allow_opaque_multiply: BoolProperty(name='Accept opaque-backdrop-only multiply', default=False,
+            description='Requires Film Transparent off; multiply changes fractional destination alpha')
+        skin_mask_resolution: IntProperty(name='Mask resolution per group', default=512, min=32, max=2048)
+        skin_mask_directory: StringProperty(name='Mask output directory', subtype='DIR_PATH', default='//live2d_masks')
+        skin_allow_lossy: BoolProperty(name='Drop masks / non-normal blends (lossy)', default=False)
         reference_resolution: IntProperty(name='Reference image long edge', default=512, min=64, max=2048)
         reference_texture_limit: IntProperty(name='Reference texture limit', default=2048, min=256, max=8192)
         show_parts: BoolProperty(name='Show part opacities', default=False)
@@ -228,7 +235,11 @@ if bpy is not None:
                                           grouping=settings.skin_grouping, manual_mapping=mapping,
                                           repair_bind=settings.skin_repair_bind, separate_static=settings.skin_separate_static,
                                           static_tolerance=settings.skin_static_tolerance,
-                                          subdivisions=int(settings.skin_subdivisions))
+                                          subdivisions=int(settings.skin_subdivisions),
+                                          appearance_mode=settings.skin_appearance,
+                                          allow_opaque_multiply=settings.skin_allow_opaque_multiply,
+                                          mask_resolution=settings.skin_mask_resolution,
+                                          mask_directory=settings.skin_mask_directory)
                 bpy.ops.object.select_all(action='DESELECT')
                 result['armature'].select_set(True)
                 context.view_layer.objects.active = result['armature']
@@ -381,7 +392,15 @@ if bpy is not None:
             box.prop(root.live2d, 'skin_subdivisions')
             box.label(text='Total budget includes an independent static influence.')
             box.prop(root.live2d, 'skin_native_effects')
-            box.prop(root.live2d, 'skin_allow_lossy')
+            box.prop(root.live2d, 'skin_appearance')
+            if root.live2d.skin_appearance == 'NATIVE_APPROXIMATE':
+                box.prop(root.live2d, 'skin_allow_opaque_multiply')
+                box.prop(root.live2d, 'skin_mask_resolution')
+                box.prop(root.live2d, 'skin_mask_directory')
+                box.label(text='Save .blend first; keep its mask folder with it.')
+                box.label(text='Cycles only; check transparent bounce convergence.')
+            else:
+                box.prop(root.live2d, 'skin_allow_lossy')
             box.operator('live2d.convert_independent')
             box.label(text='Development fallback: sampled shape keys')
             box.operator('live2d.bake_copy')

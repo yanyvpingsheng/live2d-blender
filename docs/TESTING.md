@@ -1,8 +1,8 @@
 # Testing / 测试说明
 
-This is a source-only publication of the frozen 0.2.0 add-on. Publication
-preparation changes packaging, documentation and source hygiene, not converter
-implementation. It does not incorporate later private face-mask changes.
+Version 0.3.0 integrates native Cycles legacy blend materials and alpha-only
+mask baking into the Convert operator. The v0.2 grouping/geometry regressions
+remain applicable; their filenames retain the feature-version labels.
 
 ## SDK-free Python tests
 
@@ -57,6 +57,10 @@ export PYTHONDONTWRITEBYTECODE=1
 python scripts/package.py
 blender -b --factory-startup --disable-autoexec --python tests/blender_v02_install_convert.py
 blender -b --factory-startup --disable-autoexec --python tests/blender_v02_reopen.py
+blender -b --factory-startup --disable-autoexec --python tests/test_mask_bake.py -- --blender
+blender -b --factory-startup --disable-autoexec --python tests/blender_v03_materials.py
+blender -b --factory-startup --disable-autoexec --python tests/blender_v03_appearance.py -- build
+blender -b --factory-startup --disable-autoexec --python tests/blender_v03_appearance.py -- verify
 blender -b --factory-startup --disable-autoexec --python tests/blender_smoke.py
 blender -b --factory-startup --disable-autoexec --python tests/blender_conversion_failures.py
 blender -b --factory-startup --disable-autoexec --python tests/blender_skinning_affine_cases.py
@@ -65,6 +69,13 @@ blender -b --factory-startup --disable-autoexec --python tests/blender_v02_child
 blender -b --factory-startup --disable-autoexec --python tests/blender_native_effects_smoke.py
 blender -b --factory-startup --disable-autoexec demo/native_effects_smoke.blend --python tests/blender_native_effects_verify.py
 ```
+
+The v0.3 appearance test uses the registered Convert UI, validates alpha-only
+PNG sequences and byte-identical packed textures, then moves the bundle without
+source texture files before its separate no-add-on replay. Numeric checks use
+flat interior pixels, not triangle seams or mask edges. Float-texture material
+tests separately cover texture alpha, fractional destination alpha, culling
+and visibility. Mask tests include injected write/load/restore failures.
 
 The install test regenerates the original SDK-free demo before the reopen test
 opens it. The reopen verifier deliberately imports no add-on, loads no Core,
@@ -82,8 +93,10 @@ the same demonstration filename, so do not mix its output with the v0.2 verifier
   image error. A low training error does not certify holdout frames.
 - Synthetic fixtures are project-owned geometry and tiny procedural textures.
   No real model or model-derived expectation arrays are committed.
-- Full clipping masks, advanced blends, offscreen rendering and cross-pass
-  ordering remain outside the integrated v0.2 conversion path.
+- Legacy alpha masks and normal/add/multiply are integrated in the opt-in
+  Cycles approximation. Encoded-space full-stack parity, transparent multiply,
+  new offscreen blends and arbitrary edited actions remain unsupported. See
+  [appearance limits and portable bundles](MASKS_BLENDS_zh.md).
 - Native SDK tests are not part of public CI. The optional local C++ bridge is
   source only; its built library contains external Framework code and must stay
   outside this public source tree and distributed add-on.
