@@ -1,0 +1,3 @@
+# Standalone Python tests; Blender supplies NumPy for its own integration tests.
+numpy>=1.26,<3
+Pillow>=10,<13
